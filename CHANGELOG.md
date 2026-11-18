@@ -3,6 +3,12 @@
 IMPROVEMENETS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
+* Snapshot restore now validates state size and CRC64 before invoking `FSM.Restore`, reports fixed entry-level progress, records interrupted restores outside the snapshot format, and refuses startup when required log ranges have gaps.
+* Added `SnapshotRestoreMaxBytes`, `SnapshotRestoreBufferSize`, and `SnapshotRestoreProgress` configuration for bounded, observable recovery.
+
+BUG FIXES
+
+* Persist the leader commit index when `RestoreCommittedLogs` is enabled so membership changes committed after a snapshot are replayed during restart.
 
 # 1.7.0 (June 5th, 2024)
 

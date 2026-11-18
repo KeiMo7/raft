@@ -253,6 +253,23 @@ type Config struct {
 	// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.
 	RestoreCommittedLogs bool
 
+	// SnapshotRestoreMaxBytes limits the size of a snapshot that may be
+	// restored. This bounds the memory and temporary disk needed by the Raft
+	// recovery path before the snapshot is opened; the FSM remains responsible
+	// for bounding any state it allocates while consuming the stream. A value
+	// of 0 disables the limit. The default is 1 GiB.
+	SnapshotRestoreMaxBytes int64
+
+	// SnapshotRestoreBufferSize controls the streaming buffer used while
+	// copying snapshots during restore. The default is 64 KiB. Integrity
+	// checks use a fixed 64 KiB buffer.
+	SnapshotRestoreBufferSize int
+
+	// SnapshotRestoreProgress, when set, receives progress updates while a
+	// snapshot is transferred, validated, or restored. It may be called from a
+	// monitor goroutine and must be safe for concurrent use.
+	SnapshotRestoreProgress func(SnapshotRestoreProgress)
+
 	// skipStartup allows NewRaft() to bypass all background work goroutines
 	skipStartup bool
 }
@@ -328,17 +345,19 @@ func (rc *ReloadableConfig) fromConfig(from Config) {
 // DefaultConfig returns a Config with usable defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		ProtocolVersion:    ProtocolVersionMax,
-		HeartbeatTimeout:   1000 * time.Millisecond,
-		ElectionTimeout:    1000 * time.Millisecond,
-		CommitTimeout:      50 * time.Millisecond,
-		MaxAppendEntries:   64,
-		ShutdownOnRemove:   true,
-		TrailingLogs:       10240,
-		SnapshotInterval:   120 * time.Second,
-		SnapshotThreshold:  8192,
-		LeaderLeaseTimeout: 500 * time.Millisecond,
-		LogLevel:           "DEBUG",
+		ProtocolVersion:           ProtocolVersionMax,
+		HeartbeatTimeout:          1000 * time.Millisecond,
+		ElectionTimeout:           1000 * time.Millisecond,
+		CommitTimeout:             50 * time.Millisecond,
+		MaxAppendEntries:          64,
+		ShutdownOnRemove:          true,
+		TrailingLogs:              10240,
+		SnapshotInterval:          120 * time.Second,
+		SnapshotThreshold:         8192,
+		LeaderLeaseTimeout:        500 * time.Millisecond,
+		SnapshotRestoreMaxBytes:   1 << 30,
+		SnapshotRestoreBufferSize: 64 * 1024,
+		LogLevel:                  "DEBUG",
 	}
 }
 
@@ -384,6 +403,12 @@ func ValidateConfig(config *Config) error {
 	}
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
+	}
+	if config.SnapshotRestoreMaxBytes < 0 {
+		return fmt.Errorf("SnapshotRestoreMaxBytes cannot be negative")
+	}
+	if config.SnapshotRestoreBufferSize < 0 {
+		return fmt.Errorf("SnapshotRestoreBufferSize cannot be negative")
 	}
 	return nil
 }

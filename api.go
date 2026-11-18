@@ -105,6 +105,10 @@ type Raft struct {
 	// FSM is the client state machine to apply commands to
 	fsm FSM
 
+	// restoredSnapshotID is set before startup log replay and is immutable
+	// once background goroutines start.
+	restoredSnapshotID string
+
 	// fsmMutateCh is used to send state-changing updates to the FSM. This
 	// receives pointers to commitTuple structures when applying logs or
 	// pointers to restoreFuture structures when restoring a snapshot. We
@@ -353,45 +357,51 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	}
 
 	logger := conf.getOrCreateLogger()
+	configureSnapshotRestoreProgress(snaps, conf.SnapshotRestoreProgress)
+	var restoreFailures []error
+	restoredSnapshot := false
 
 	for _, snapshot := range snapshots {
+		if err := checkSnapshotRestoreLimit(snapshot.ID, snapshot.Size, conf.SnapshotRestoreMaxBytes); err != nil {
+			restoreFailures = append(restoreFailures, err)
+			continue
+		}
+
 		var source io.ReadCloser
 		_, source, err = snaps.Open(snapshot.ID)
 		if err != nil {
 			// Skip this one and try the next. We will detect if we
 			// couldn't open any snapshots.
+			restoreFailures = append(restoreFailures, fmt.Errorf("snapshot %s: %w", snapshot.ID, err))
 			continue
 		}
 
-		// Note this is the one place we call fsm.Restore without the
-		// fsmRestoreAndMeasure wrapper since this function should only be called to
-		// reset state on disk and the FSM passed will not be used for a running
-		// server instance. If the same process will eventually become a Raft peer
-		// then it will call NewRaft and restore again from disk then which will
-		// report metrics.
 		snapLogger := logger.With(
 			"id", snapshot.ID,
 			"last-index", snapshot.Index,
 			"last-term", snapshot.Term,
 			"size-in-bytes", snapshot.Size,
 		)
-		crc := newCountingReadCloser(source)
-		monitor := startSnapshotRestoreMonitor(snapLogger, crc, snapshot.Size, false)
-		err = fsm.Restore(crc)
-		// Close the source after the restore has completed
+		if snapshot.Version == 0 {
+			snapLogger.Warn("restoring legacy snapshot version 0; create a new snapshot after recovery to migrate to version 1")
+		}
+		err = fsmRestoreAndMeasureWithProgress(
+			snapLogger, fsm, source, snapshot.Size, snapshot.ID, "fsm-restore", conf.SnapshotRestoreProgress,
+		)
 		_ = source.Close()
-		monitor.StopAndWait()
 		if err != nil {
-			// Same here, skip and try the next one.
-			continue
+			// The FSM may contain partial state, so do not attempt another
+			// snapshot in the same process.
+			return fmt.Errorf("%w: snapshot %s: %v", ErrSnapshotRestoreIncomplete, snapshot.ID, err)
 		}
 
 		snapshotIndex = snapshot.Index
 		snapshotTerm = snapshot.Term
+		restoredSnapshot = true
 		break
 	}
-	if len(snapshots) > 0 && (snapshotIndex == 0 || snapshotTerm == 0) {
-		return fmt.Errorf("failed to restore any of the available snapshots")
+	if len(snapshots) > 0 && !restoredSnapshot {
+		return fmt.Errorf("failed to restore any of the available snapshots: %w", errors.Join(restoreFailures...))
 	}
 
 	// The snapshot information is the best known end point for the data
@@ -403,6 +413,9 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	lastLogIndex, err := logs.LastIndex()
 	if err != nil {
 		return fmt.Errorf("failed to find last log: %v", err)
+	}
+	if err := validateLogRange(logs, snapshotIndex+1, lastLogIndex); err != nil {
+		return err
 	}
 	for index := snapshotIndex + 1; index <= lastLogIndex; index++ {
 		var entry Log
@@ -598,6 +611,8 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	r.setCurrentTerm(currentTerm)
 	r.setLastLog(lastLog.Index, lastLog.Term)
 
+	configureSnapshotRestoreProgress(snaps, conf.SnapshotRestoreProgress)
+
 	// Attempt to restore a snapshot if there are any.
 	if err := r.restoreSnapshot(); err != nil {
 		return nil, err
@@ -610,15 +625,8 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	// Scan through the log for any configuration change entries.
 	snapshotIndex, _ := r.getLastSnapshot()
 	lastappliedIndex := r.getLastApplied()
-	for index := max(snapshotIndex, lastappliedIndex) + 1; index <= lastLog.Index; index++ {
-		var entry Log
-		if err := r.logs.GetLog(index, &entry); err != nil {
-			r.logger.Error("failed to get log", "index", index, "error", err)
-			panic(err)
-		}
-		if err := r.processConfigurationLogEntry(&entry); err != nil {
-			return nil, err
-		}
+	if err := r.scanConfigurationLogs(max(snapshotIndex, lastappliedIndex)+1, lastLog.Index); err != nil {
+		return nil, err
 	}
 	r.logger.Info("initial configuration",
 		"index", r.configurations.latestIndex,
@@ -643,15 +651,25 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 // of them can be restored. This is called at initialization time, and is
 // completely unsafe to call at any other time.
 func (r *Raft) restoreSnapshot() error {
+	if err := r.reportPendingSnapshotRestore(); err != nil {
+		return err
+	}
+
 	snapshots, err := r.snapshots.List()
 	if err != nil {
 		r.logger.Error("failed to list snapshots", "error", err)
 		return err
 	}
 
+	var failures []error
+
 	// Try to load in order of newest to oldest
 	for _, snapshot := range snapshots {
-		if success := r.tryRestoreSingleSnapshot(snapshot); !success {
+		if err := r.tryRestoreSingleSnapshot(snapshot); err != nil {
+			failures = append(failures, fmt.Errorf("snapshot %s: %w", snapshot.ID, err))
+			if errors.Is(err, ErrSnapshotRestoreIncomplete) {
+				return err
+			}
 			continue
 		}
 
@@ -678,20 +696,44 @@ func (r *Raft) restoreSnapshot() error {
 		r.setLatestConfiguration(conf, index)
 
 		// Success!
+		r.restoredSnapshotID = snapshot.ID
 		return nil
 	}
 
 	// If we had snapshots and failed to load them, its an error
 	if len(snapshots) > 0 {
-		return fmt.Errorf("failed to load any existing snapshots")
+		return fmt.Errorf("failed to load any existing snapshots: %w", errors.Join(failures...))
 	}
 	return nil
 }
 
-func (r *Raft) tryRestoreSingleSnapshot(snapshot *SnapshotMeta) bool {
-	if r.config().NoSnapshotRestoreOnStart {
-		return true
+func (r *Raft) reportPendingSnapshotRestore() error {
+	journal, ok := r.snapshots.(snapshotRestoreJournal)
+	if !ok {
+		return nil
 	}
+	state, err := journal.PendingSnapshotRestore()
+	if err != nil {
+		return fmt.Errorf("failed to read pending snapshot restore state: %w", err)
+	}
+	if state != nil {
+		r.logger.Warn("previous snapshot restore was interrupted; discarding the partial FSM state and rebuilding from the original snapshot",
+			"snapshot-id", state.SnapshotID,
+			"last-index", state.Index,
+			"last-term", state.Term,
+			"phase", state.Phase,
+			"started-at", state.StartedAt,
+			"last-error", state.LastError,
+		)
+	}
+	return nil
+}
+
+func (r *Raft) tryRestoreSingleSnapshot(snapshot *SnapshotMeta) error {
+	if r.config().NoSnapshotRestoreOnStart {
+		return nil
+	}
+	restoreStart := time.Now()
 
 	snapLogger := r.logger.With(
 		"id", snapshot.ID,
@@ -701,23 +743,54 @@ func (r *Raft) tryRestoreSingleSnapshot(snapshot *SnapshotMeta) bool {
 	)
 
 	snapLogger.Info("starting restore from snapshot")
+	if snapshot.Version == 0 {
+		snapLogger.Warn("restoring legacy snapshot version 0; the next snapshot will use version 1")
+	}
+
+	if err := checkSnapshotRestoreLimit(snapshot.ID, snapshot.Size, r.config().SnapshotRestoreMaxBytes); err != nil {
+		return err
+	}
+
+	configureSnapshotRestoreProgress(r.snapshots, r.config().SnapshotRestoreProgress)
+	journal, hasJournal := r.snapshots.(snapshotRestoreJournal)
 
 	_, source, err := r.snapshots.Open(snapshot.ID)
 	if err != nil {
 		snapLogger.Error("failed to open snapshot", "error", err)
-		return false
+		return err
+	}
+	if hasJournal {
+		if err := journal.beginSnapshotRestore(snapshot); err != nil {
+			_ = source.Close()
+			return fmt.Errorf("failed to record snapshot restore journal: %w", err)
+		}
 	}
 
-	if err := fsmRestoreAndMeasure(snapLogger, r.fsm, source, snapshot.Size); err != nil {
+	if err := fsmRestoreAndMeasureWithProgress(
+		snapLogger, r.fsm, source, snapshot.Size, snapshot.ID, "fsm-restore", r.config().SnapshotRestoreProgress,
+	); err != nil {
 		_ = source.Close()
 		snapLogger.Error("failed to restore snapshot", "error", err)
-		return false
+		if hasJournal {
+			_ = journal.failSnapshotRestore(snapshot.ID, err)
+		}
+		return fmt.Errorf("%w: %v", ErrSnapshotRestoreIncomplete, err)
 	}
 	_ = source.Close()
 
-	snapLogger.Info("restored from snapshot")
+	if hasJournal {
+		if err := journal.finishSnapshotRestore(snapshot.ID); err != nil {
+			return fmt.Errorf("failed to finalize snapshot restore journal: %w", err)
+		}
+	}
 
-	return true
+	duration := time.Since(restoreStart)
+	snapLogger.Info("restored from snapshot",
+		"duration", duration,
+		"duration-ms", duration.Milliseconds(),
+	)
+
+	return nil
 }
 
 // restoreFromCommittedLogs recovers the Raft node from committed logs.
@@ -748,9 +821,20 @@ func (r *Raft) restoreFromCommittedLogs() error {
 	if commitIndex > lastIndex {
 		commitIndex = lastIndex
 	}
+	if lastApplied := r.getLastApplied(); commitIndex < lastApplied {
+		commitIndex = lastApplied
+	}
 
+	start := r.getLastApplied() + 1
+	if start <= commitIndex {
+		if err := r.replayCommittedLogs(start, commitIndex); err != nil {
+			return err
+		}
+	}
 	r.setCommitIndex(commitIndex)
-	r.processLogs(commitIndex, nil)
+	if r.configurations.latestIndex <= commitIndex {
+		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+	}
 	return nil
 }
 

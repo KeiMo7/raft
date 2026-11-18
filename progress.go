@@ -21,6 +21,11 @@ type snapshotRestoreMonitor struct {
 	cr              CountingReader
 	size            int64
 	networkTransfer bool
+	snapshotID      string
+	phase           string
+	entryProgress   FSMRestoreProgress
+	progressFn      func(SnapshotRestoreProgress)
+	started         time.Time
 
 	once   sync.Once
 	cancel func()
@@ -33,6 +38,21 @@ func startSnapshotRestoreMonitor(
 	size int64,
 	networkTransfer bool,
 ) *snapshotRestoreMonitor {
+	return startSnapshotRestoreMonitorWithProgress(
+		logger, cr, size, networkTransfer, "", "", nil, nil,
+	)
+}
+
+func startSnapshotRestoreMonitorWithProgress(
+	logger hclog.Logger,
+	cr CountingReader,
+	size int64,
+	networkTransfer bool,
+	snapshotID string,
+	phase string,
+	entryProgress FSMRestoreProgress,
+	progressFn func(SnapshotRestoreProgress),
+) *snapshotRestoreMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &snapshotRestoreMonitor{
@@ -40,10 +60,16 @@ func startSnapshotRestoreMonitor(
 		cr:              cr,
 		size:            size,
 		networkTransfer: networkTransfer,
+		snapshotID:      snapshotID,
+		phase:           phase,
+		entryProgress:   entryProgress,
+		progressFn:      progressFn,
+		started:         time.Now(),
 		cancel:          cancel,
 		doneCh:          make(chan struct{}),
 	}
 	go m.run(ctx)
+	m.runOnce()
 	return m
 }
 
@@ -53,24 +79,50 @@ func (m *snapshotRestoreMonitor) run(ctx context.Context) {
 	ticker := time.NewTicker(snapshotRestoreMonitorInterval)
 	defer ticker.Stop()
 
-	ranOnce := false
 	for {
 		select {
 		case <-ctx.Done():
-			if !ranOnce {
-				m.runOnce()
-			}
 			return
 		case <-ticker.C:
 			m.runOnce()
-			ranOnce = true
 		}
 	}
 }
 
 func (m *snapshotRestoreMonitor) runOnce() {
 	readBytes := m.cr.Count()
-	pct := float64(100*readBytes) / float64(m.size)
+	totalBytes := m.size
+	pct := float64(100)
+	if totalBytes > 0 {
+		pct = float64(100*readBytes) / float64(totalBytes)
+		if pct > 100 {
+			pct = 100
+		}
+	}
+
+	appliedEntries, totalEntries := uint64(0), uint64(1)
+	if m.entryProgress != nil {
+		appliedEntries, totalEntries = m.entryProgress.RestoreProgress()
+		if totalEntries == 0 {
+			totalEntries = 1
+		}
+	} else if totalBytes == 0 || readBytes >= totalBytes {
+		appliedEntries = 1
+	}
+	elapsed := time.Since(m.started)
+
+	progress := SnapshotRestoreProgress{
+		SnapshotID:     m.snapshotID,
+		Phase:          m.phase,
+		AppliedEntries: appliedEntries,
+		TotalEntries:   totalEntries,
+		ReadBytes:      readBytes,
+		TotalBytes:     totalBytes,
+		Elapsed:        elapsed,
+	}
+	if m.progressFn != nil {
+		m.progressFn(progress)
+	}
 
 	message := "snapshot restore progress"
 	if m.networkTransfer {
@@ -78,8 +130,14 @@ func (m *snapshotRestoreMonitor) runOnce() {
 	}
 
 	m.logger.Info(message,
+		"snapshot-id", m.snapshotID,
+		"phase", m.phase,
 		"read-bytes", readBytes,
+		"total-bytes", totalBytes,
+		"applied-entries", appliedEntries,
+		"total-entries", totalEntries,
 		"percent-complete", hclog.Fmt("%0.2f%%", pct),
+		"elapsed", elapsed,
 	)
 }
 
@@ -87,6 +145,7 @@ func (m *snapshotRestoreMonitor) StopAndWait() {
 	m.once.Do(func() {
 		m.cancel()
 		<-m.doneCh
+		m.runOnce()
 	})
 }
 

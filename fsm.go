@@ -84,7 +84,18 @@ type FSMSnapshot interface {
 // to the FSM. This is done async of other logs since we don't want
 // the FSM to block our internal operations.
 func (r *Raft) runFSM() {
-	var lastIndex, lastTerm uint64
+	lastIndex := r.getLastApplied()
+	var lastTerm uint64
+	if lastIndex > 0 {
+		if snapIndex, snapTerm := r.getLastSnapshot(); snapIndex == lastIndex {
+			lastTerm = snapTerm
+		} else {
+			var lastLog Log
+			if err := r.logs.GetLog(lastIndex, &lastLog); err == nil {
+				lastTerm = lastLog.Term
+			}
+		}
+	}
 
 	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)
 	configStore, configStoreEnabled := r.fsm.(ConfigurationStore)
@@ -186,6 +197,9 @@ func (r *Raft) runFSM() {
 	}
 
 	restore := func(req *restoreFuture) {
+		cfg := r.config()
+		configureSnapshotRestoreProgress(r.snapshots, cfg.SnapshotRestoreProgress)
+
 		// Open the snapshot
 		meta, source, err := r.snapshots.Open(req.ID)
 		if err != nil {
@@ -201,10 +215,35 @@ func (r *Raft) runFSM() {
 			"size-in-bytes", meta.Size,
 		)
 
-		// Attempt to restore
-		if err := fsmRestoreAndMeasure(snapLogger, r.fsm, source, meta.Size); err != nil {
-			req.respond(fmt.Errorf("failed to restore snapshot %v: %v", req.ID, err))
+		if err := checkSnapshotRestoreLimit(req.ID, meta.Size, cfg.SnapshotRestoreMaxBytes); err != nil {
+			req.respond(err)
 			return
+		}
+
+		journal, hasJournal := r.snapshots.(snapshotRestoreJournal)
+		if hasJournal {
+			if err := journal.beginSnapshotRestore(meta); err != nil {
+				_ = source.Close()
+				req.respond(fmt.Errorf("failed to record snapshot restore journal: %w", err))
+				return
+			}
+		}
+
+		// Attempt to restore
+		if err := fsmRestoreAndMeasureWithProgress(
+			snapLogger, r.fsm, source, meta.Size, req.ID, "fsm-restore", cfg.SnapshotRestoreProgress,
+		); err != nil {
+			if hasJournal {
+				_ = journal.failSnapshotRestore(req.ID, err)
+			}
+			req.respond(fmt.Errorf("%w: failed to restore snapshot %v: %v", ErrSnapshotRestoreIncomplete, req.ID, err))
+			return
+		}
+		if hasJournal {
+			if err := journal.finishSnapshotRestore(req.ID); err != nil {
+				req.respond(fmt.Errorf("failed to finalize snapshot restore journal: %w", err))
+				return
+			}
 		}
 
 		// Update the last index and term
@@ -267,19 +306,59 @@ func (r *Raft) runFSM() {
 // and report timing metrics. The caller is still responsible for calling Close
 // on the source in all cases.
 func fsmRestoreAndMeasure(logger hclog.Logger, fsm FSM, source io.ReadCloser, snapshotSize int64) error {
+	return fsmRestoreAndMeasureWithProgress(
+		logger, fsm, source, snapshotSize, "", "fsm-restore", nil,
+	)
+}
+
+func fsmRestoreAndMeasureWithProgress(
+	logger hclog.Logger,
+	fsm FSM,
+	source io.ReadCloser,
+	snapshotSize int64,
+	snapshotID string,
+	phase string,
+	progressFn func(SnapshotRestoreProgress),
+) error {
 	start := time.Now()
 
 	crc := newCountingReadCloser(source)
 
-	monitor := startSnapshotRestoreMonitor(logger, crc, snapshotSize, false)
+	var entryProgress FSMRestoreProgress
+	if p, ok := fsm.(FSMRestoreProgress); ok {
+		entryProgress = p
+	}
+	monitor := startSnapshotRestoreMonitorWithProgress(
+		logger, crc, snapshotSize, false, snapshotID, phase, entryProgress, progressFn,
+	)
 	defer monitor.StopAndWait()
 
 	if err := fsm.Restore(crc); err != nil {
+		logger.Error("snapshot restore failed",
+			"snapshot-id", snapshotID,
+			"duration", time.Since(start),
+			"read-bytes", crc.Count(),
+			"total-bytes", snapshotSize,
+			"error", err,
+		)
 		return err
 	}
+	duration := time.Since(start)
 	metrics.MeasureSince([]string{"raft", "fsm", "restore"}, start)
 	metrics.SetGauge([]string{"raft", "fsm", "lastRestoreDuration"},
-		float32(time.Since(start).Milliseconds()))
+		float32(duration.Milliseconds()))
+
+	fields := []interface{}{
+		"snapshot-id", snapshotID,
+		"duration", duration,
+		"duration-ms", duration.Milliseconds(),
+		"read-bytes", crc.Count(),
+		"total-bytes", snapshotSize,
+	}
+	if hasher, ok := fsm.(FSMStateHasher); ok {
+		fields = append(fields, "state-hash", hasher.StateHash())
+	}
+	logger.Info("snapshot restore complete", fields...)
 
 	return nil
 }

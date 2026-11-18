@@ -789,6 +789,7 @@ func (r *Raft) leaderLoop() {
 			oldCommitIndex := r.getCommitIndex()
 			commitIndex := r.leaderState.commitment.getCommitIndex()
 			r.setCommitIndex(commitIndex)
+			r.tryStageCommitIndex(commitIndex)
 
 			// New configuration has been committed, set it as the committed
 			// value.
@@ -1108,7 +1109,15 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 	// Sanity check the version.
 	version := meta.Version
 	if version < SnapshotVersionMin || version > SnapshotVersionMax {
-		return fmt.Errorf("unsupported snapshot version %d", version)
+		return &SnapshotVersionError{
+			ID:      meta.ID,
+			Version: version,
+			Min:     SnapshotVersionMin,
+			Max:     SnapshotVersionMax,
+		}
+	}
+	if err := checkSnapshotRestoreLimit(meta.ID, meta.Size, r.config().SnapshotRestoreMaxBytes); err != nil {
+		return err
 	}
 
 	// We don't support snapshots while there's a config change
@@ -1150,7 +1159,16 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %v", err)
 	}
-	n, err := io.Copy(sink, reader)
+	bufSize := r.config().SnapshotRestoreBufferSize
+	if bufSize <= 0 {
+		bufSize = 64 * 1024
+	}
+	counted := newCountingReader(reader)
+	copyMonitor := startSnapshotRestoreMonitorWithProgress(
+		r.logger, counted, meta.Size, false, meta.ID, "external-copy", nil, r.config().SnapshotRestoreProgress,
+	)
+	n, err := io.CopyBuffer(sink, io.LimitReader(counted, meta.Size+1), make([]byte, bufSize))
+	copyMonitor.StopAndWait()
 	if err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("failed to write snapshot: %v", err)
@@ -1175,7 +1193,9 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 		return ErrRaftShutdown
 	}
 	if err := fsm.Error(); err != nil {
-		panic(fmt.Errorf("failed to restore snapshot: %v", err))
+		r.logger.Error("snapshot restore failed; shutting down to avoid serving partial state", "error", err)
+		r.Shutdown()
+		return fmt.Errorf("%w: failed to restore snapshot; restart with a fresh FSM before retrying: %v", ErrSnapshotRestoreIncomplete, err)
 	}
 
 	// We set the last log so it looks like we've stored the empty
@@ -1850,7 +1870,12 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	// Sanity check the version
 	if req.SnapshotVersion < SnapshotVersionMin ||
 		req.SnapshotVersion > SnapshotVersionMax {
-		rpcErr = fmt.Errorf("unsupported snapshot version %d", req.SnapshotVersion)
+		rpcErr = &SnapshotVersionError{
+			ID:      string(req.ID),
+			Version: req.SnapshotVersion,
+			Min:     SnapshotVersionMin,
+			Max:     SnapshotVersionMax,
+		}
 		return
 	}
 
@@ -1891,6 +1916,10 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		}
 		reqConfigurationIndex = req.LastLogIndex
 	}
+	if err := checkSnapshotRestoreLimit(string(req.ID), req.Size, r.config().SnapshotRestoreMaxBytes); err != nil {
+		rpcErr = err
+		return
+	}
 	version := getSnapshotVersion(r.protocolVersion)
 	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
 		reqConfiguration, reqConfigurationIndex, r.trans)
@@ -1905,8 +1934,14 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	countingRPCReader := newCountingReader(rpc.Reader)
 
 	// Spill the remote snapshot to disk
-	transferMonitor := startSnapshotRestoreMonitor(r.logger, countingRPCReader, req.Size, true)
-	n, err := io.Copy(sink, countingRPCReader)
+	transferMonitor := startSnapshotRestoreMonitorWithProgress(
+		r.logger, countingRPCReader, req.Size, true, sink.ID(), "network-transfer", nil, r.config().SnapshotRestoreProgress,
+	)
+	bufSize := r.config().SnapshotRestoreBufferSize
+	if bufSize <= 0 {
+		bufSize = 64 * 1024
+	}
+	n, err := io.CopyBuffer(sink, io.LimitReader(countingRPCReader, req.Size+1), make([]byte, bufSize))
 	transferMonitor.StopAndWait()
 	if err != nil {
 		_ = sink.Cancel()
@@ -1947,6 +1982,10 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	if err := future.Error(); err != nil {
 		r.logger.Error("failed to restore snapshot", "error", err)
 		rpcErr = err
+		if errors.Is(err, ErrSnapshotRestoreIncomplete) {
+			r.logger.Error("snapshot install left the FSM in an indeterminate state; shutting down")
+			r.Shutdown()
+		}
 		return
 	}
 

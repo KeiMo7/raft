@@ -6,7 +6,9 @@ package raft
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc64"
@@ -15,7 +17,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -27,6 +31,11 @@ const (
 	metaFilePath  = "meta.json"
 	stateFilePath = "state.bin"
 	tmpSuffix     = ".tmp"
+
+	restoreStateFile    = ".restore-state.json"
+	restoreStateTmpFile = ".restore-state.json.tmp"
+	snapshotHashBufSize = 64 * 1024
+	maxSnapshotMetaSize = 4 * 1024 * 1024
 )
 
 // FileSnapshotStore implements the SnapshotStore interface and allows
@@ -35,6 +44,15 @@ type FileSnapshotStore struct {
 	path   string
 	retain int
 	logger hclog.Logger
+	// createMu makes snapshot ID selection and temporary directory creation
+	// atomic when the snapshot thread and an install-snapshot RPC race.
+	createMu sync.Mutex
+	// restoreMu serializes the small restore journal written outside snapshot
+	// directories. Snapshot state files themselves are never modified.
+	restoreMu sync.Mutex
+	// progressMu protects the optional restore progress callback.
+	progressMu sync.RWMutex
+	progressFn func(SnapshotRestoreProgress)
 
 	// noSync, if true, skips crash-safe file fsync api calls.
 	// It's a private field, only used in testing
@@ -114,7 +132,29 @@ func NewFileSnapshotStoreWithLogger(base string, retain int, logger hclog.Logger
 	if err := store.testPermissions(); err != nil {
 		return nil, fmt.Errorf("permissions test failed: %v", err)
 	}
+	if err := store.cleanupTemporarySnapshots(); err != nil {
+		return nil, fmt.Errorf("failed to clean temporary snapshots: %v", err)
+	}
 	return store, nil
+}
+
+func (f *FileSnapshotStore) cleanupTemporarySnapshots() error {
+	entries, err := os.ReadDir(f.path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, tmpSuffix) {
+			continue
+		}
+		path := filepath.Join(f.path, name)
+		f.logger.Warn("removing stale temporary snapshot artifact", "path", path)
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // NewFileSnapshotStore creates a new FileSnapshotStore based
@@ -156,6 +196,23 @@ func snapshotName(term, index uint64) string {
 	return fmt.Sprintf("%d-%d-%d", term, index, msec)
 }
 
+func uniqueSnapshotName(path string, term, index uint64) string {
+	base := snapshotName(term, index)
+	name := base
+	for suffix := 1; ; suffix++ {
+		_, finalErr := os.Stat(filepath.Join(path, name))
+		_, tmpErr := os.Stat(filepath.Join(path, name+tmpSuffix))
+		if (finalErr != nil && !errors.Is(finalErr, os.ErrNotExist)) ||
+			(tmpErr != nil && !errors.Is(tmpErr, os.ErrNotExist)) {
+			return name
+		}
+		if errors.Is(finalErr, os.ErrNotExist) && errors.Is(tmpErr, os.ErrNotExist) {
+			return name
+		}
+		name = base + "-" + strconv.Itoa(suffix)
+	}
+}
+
 // Create is used to start a new snapshot
 func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
@@ -164,16 +221,21 @@ func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 		return nil, fmt.Errorf("unsupported snapshot version %d", version)
 	}
 
-	// Create a new path
-	name := snapshotName(term, index)
+	// Create a new path. Serialize name selection and temporary directory
+	// creation so a concurrent snapshot and install-snapshot cannot race to the
+	// same ID.
+	f.createMu.Lock()
+	name := uniqueSnapshotName(f.path, term, index)
 	path := filepath.Join(f.path, name+tmpSuffix)
 	f.logger.Info("creating new snapshot", "path", path)
 
 	// Make the directory
 	if err := os.MkdirAll(path, 0o755); err != nil {
+		f.createMu.Unlock()
 		f.logger.Error("failed to make snapshot directly", "error", err)
 		return nil, err
 	}
+	f.createMu.Unlock()
 
 	// Create the sink
 	sink := &FileSnapshotSink{
@@ -268,14 +330,20 @@ func (f *FileSnapshotStore) getSnapshots() ([]*fileSnapshotMeta, error) {
 		// Try to read the meta data
 		meta, err := f.readMeta(dirName)
 		if err != nil {
-			f.logger.Warn("failed to read metadata", "name", dirName, "error", err)
-			continue
+			return nil, &SnapshotIntegrityError{
+				ID:     dirName,
+				Reason: "failed to read metadata",
+				Err:    err,
+			}
 		}
 
 		// Make sure we can understand this version.
-		if meta.Version < SnapshotVersionMin || meta.Version > SnapshotVersionMax {
-			f.logger.Warn("snapshot version not supported", "name", dirName, "version", meta.Version)
-			continue
+		if err := validateSnapshotVersion(dirName, meta.Version); err != nil {
+			return nil, err
+		}
+		if meta.Version == 0 {
+			f.logger.Warn("found legacy snapshot; it can be restored but the next snapshot will use version 1",
+				"name", dirName)
 		}
 
 		// Append, but only return up to the retain count
@@ -298,6 +366,17 @@ func (f *FileSnapshotStore) readMeta(name string) (*fileSnapshotMeta, error) {
 	}
 	defer func() { _ = fh.Close() }()
 
+	stat, err := fh.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() > maxSnapshotMetaSize {
+		return nil, &SnapshotIntegrityError{
+			ID:     name,
+			Reason: fmt.Sprintf("metadata exceeds the %d byte limit", maxSnapshotMetaSize),
+		}
+	}
+
 	// Buffer the file IO
 	buffered := bufio.NewReader(fh)
 
@@ -318,6 +397,9 @@ func (f *FileSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error
 		f.logger.Error("failed to get meta data to open snapshot", "error", err)
 		return nil, nil, err
 	}
+	if err := validateSnapshotVersion(id, meta.Version); err != nil {
+		return nil, nil, err
+	}
 
 	// Open the state file
 	statePath := filepath.Join(f.path, id, stateFilePath)
@@ -327,11 +409,31 @@ func (f *FileSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error
 		return nil, nil, err
 	}
 
+	stat, err := fh.Stat()
+	if err != nil {
+		_ = fh.Close()
+		return nil, nil, err
+	}
+	if stat.Size() != meta.Size {
+		_ = fh.Close()
+		return nil, nil, &SnapshotIntegrityError{
+			ID:           id,
+			Reason:       "state file size does not match metadata (file is truncated or has trailing data)",
+			ExpectedSize: meta.Size,
+			ActualSize:   stat.Size(),
+		}
+	}
+
 	// Create a CRC64 hash
 	stateHash := crc64.New(crc64.MakeTable(crc64.ECMA))
 
 	// Compute the hash
-	_, err = io.Copy(stateHash, fh)
+	counted := newCountingReader(fh)
+	verifyMonitor := startSnapshotRestoreMonitorWithProgress(
+		f.logger, counted, stat.Size(), false, id, "verify", nil, f.getSnapshotRestoreProgress(),
+	)
+	_, err = io.CopyBuffer(stateHash, counted, make([]byte, snapshotHashBufSize))
+	verifyMonitor.StopAndWait()
 	if err != nil {
 		f.logger.Error("failed to read state file", "error", err)
 		_ = fh.Close()
@@ -343,7 +445,14 @@ func (f *FileSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error
 	if !bytes.Equal(meta.CRC, computed) {
 		f.logger.Error("CRC checksum failed", "stored", meta.CRC, "computed", computed)
 		_ = fh.Close()
-		return nil, nil, fmt.Errorf("CRC mismatch")
+		return nil, nil, &SnapshotIntegrityError{
+			ID:           id,
+			Reason:       "CRC64 checksum does not match metadata",
+			ExpectedSize: meta.Size,
+			ActualSize:   stat.Size(),
+			ExpectedCRC:  hex.EncodeToString(meta.CRC),
+			ActualCRC:    hex.EncodeToString(computed),
+		}
 	}
 
 	// Seek to the start
@@ -359,7 +468,189 @@ func (f *FileSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error
 		fh: fh,
 	}
 
+	f.logger.Info("snapshot integrity verified",
+		"id", id,
+		"version", meta.Version,
+		"size-in-bytes", meta.Size,
+		"crc64-ecma", hex.EncodeToString(computed),
+	)
+
 	return &meta.SnapshotMeta, buffered, nil
+}
+
+// Verify performs a read-only size and checksum validation of a snapshot. It
+// never modifies or removes the snapshot.
+func (f *FileSnapshotStore) Verify(id string) (*SnapshotVerification, error) {
+	start := time.Now()
+	meta, source, err := f.Open(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := source.Close(); err != nil {
+		return nil, err
+	}
+
+	fh, err := os.Open(filepath.Join(f.path, id, stateFilePath))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fh.Close() }()
+	stateHash := crc64.New(crc64.MakeTable(crc64.ECMA))
+	if _, err := io.CopyBuffer(stateHash, fh, make([]byte, snapshotHashBufSize)); err != nil {
+		return nil, err
+	}
+
+	return &SnapshotVerification{
+		ID:       id,
+		Version:  meta.Version,
+		Size:     meta.Size,
+		Checksum: hex.EncodeToString(stateHash.Sum(nil)),
+		Duration: time.Since(start),
+	}, nil
+}
+
+// SetSnapshotRestoreProgress configures the callback used for integrity-check
+// progress emitted by Open. It may be updated while snapshots are being read.
+func (f *FileSnapshotStore) SetSnapshotRestoreProgress(progressFn func(SnapshotRestoreProgress)) {
+	f.progressMu.Lock()
+	f.progressFn = progressFn
+	f.progressMu.Unlock()
+}
+
+func (f *FileSnapshotStore) getSnapshotRestoreProgress() func(SnapshotRestoreProgress) {
+	f.progressMu.RLock()
+	defer f.progressMu.RUnlock()
+	return f.progressFn
+}
+
+// PendingSnapshotRestore returns the last restore journal entry. A non-nil
+// result means a previous process did not finish restoring the FSM and a clean
+// rebuild from the original snapshot is required.
+func (f *FileSnapshotStore) PendingSnapshotRestore() (*SnapshotRestoreState, error) {
+	f.restoreMu.Lock()
+	defer f.restoreMu.Unlock()
+	return f.readRestoreStateLocked()
+}
+
+func (f *FileSnapshotStore) beginSnapshotRestore(meta *SnapshotMeta) error {
+	f.restoreMu.Lock()
+	defer f.restoreMu.Unlock()
+
+	now := time.Now()
+	state := &SnapshotRestoreState{
+		SnapshotID: meta.ID,
+		Index:      meta.Index,
+		Term:       meta.Term,
+		Phase:      "fsm-restore",
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+	return f.writeRestoreStateLocked(state)
+}
+
+func (f *FileSnapshotStore) finishSnapshotRestore(id string) error {
+	f.restoreMu.Lock()
+	defer f.restoreMu.Unlock()
+
+	state, err := f.readRestoreStateLocked()
+	if err != nil {
+		return err
+	}
+	if state == nil || state.SnapshotID != id {
+		return nil
+	}
+	err = os.Remove(filepath.Join(f.path, restoreStateFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (f *FileSnapshotStore) failSnapshotRestore(id string, restoreErr error) error {
+	f.restoreMu.Lock()
+	defer f.restoreMu.Unlock()
+
+	state, err := f.readRestoreStateLocked()
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		state = &SnapshotRestoreState{
+			SnapshotID: id,
+			StartedAt:  time.Now(),
+		}
+	}
+	state.Phase = "failed"
+	state.UpdatedAt = time.Now()
+	if restoreErr != nil {
+		state.LastError = restoreErr.Error()
+	}
+	return f.writeRestoreStateLocked(state)
+}
+
+func (f *FileSnapshotStore) readRestoreStateLocked() (*SnapshotRestoreState, error) {
+	path := filepath.Join(f.path, restoreStateFile)
+	stat, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() > maxSnapshotMetaSize {
+		return nil, fmt.Errorf("snapshot restore journal exceeds %d bytes", maxSnapshotMetaSize)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	state := &SnapshotRestoreState{}
+	if err := json.Unmarshal(data, state); err != nil {
+		return nil, fmt.Errorf("failed to read snapshot restore journal: %w", err)
+	}
+	return state, nil
+}
+
+func (f *FileSnapshotStore) writeRestoreStateLocked(state *SnapshotRestoreState) error {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
+	tmpPath := filepath.Join(f.path, restoreStateTmpFile)
+	finalPath := filepath.Join(f.path, restoreStateFile)
+	fh, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(data); err != nil {
+		_ = fh.Close()
+		return err
+	}
+	if !f.noSync {
+		if err := fh.Sync(); err != nil {
+			_ = fh.Close()
+			return err
+		}
+	}
+	if err := fh.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return err
+	}
+	if !f.noSync && runtime.GOOS != "windows" {
+		dir, err := os.Open(f.path)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = dir.Close() }()
+		if err := dir.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReapSnapshots reaps any snapshots beyond the retain count.
